@@ -171,12 +171,18 @@ def plot_top_events(results_df, window_data_df, n=5):
     top_events = results_df.nlargest(n, 'composite_score')['event'].unique()
     plot_data = window_data_df[window_data_df['event'].isin(top_events)]
     
+    # Remove any problematic parameters that might be passed through
+    plot_kwargs = {
+        'x': 'hour_offset',
+        'y': 'diff',
+        'errorbar': None,  # Disable error bars to avoid the issue
+        'estimator': None  # Disable any aggregation
+    }
+    
     g = sns.FacetGrid(plot_data, col='event', col_wrap=3, height=4, sharey=False)
     g.map_dataframe(
         sns.lineplot,
-        x='hour_offset',
-        y='diff',
-        errorbar=('ci', 95)
+        **plot_kwargs
     )
     g.set_titles('{col_name}')
     g.set_axis_labels('Hours Relative to Event', 'Price Range')
@@ -184,6 +190,7 @@ def plot_top_events(results_df, window_data_df, n=5):
         ax.axvline(0, color='red', linestyle='--')
     plt.tight_layout()
     plt.show()
+
 
 # Main execution
 if __name__ == '__main__':
