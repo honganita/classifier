@@ -6,34 +6,34 @@ from datetime import datetime, timedelta
 import pytz
 from scipy import stats
 
-# Load and prepare SOFR data
+# Modified to load multiple instruments
 def load_sofr_data(bquery, start_date, end_date):
-    df = bquery.bdib('USOSFR10 BGN Curncy', event_type='TRADE', interval=60, 
-                    start_datetime=start_date, end_datetime=end_date)
-    df['time'] = pd.to_datetime(df['time'])
-    df['diff'] = df['high'] - df['low']
-    df['returns'] = df['close'].pct_change()  # Add returns for additional volatility measure
-    return df[['time', 'high', 'low', 'close', 'diff', 'returns']]  # Include all needed columns
+    # Load both 5-year and 10-year SOFR swaps
+    df5 = bquery.bdib('USOSFR5 BGN Curncy', event_type='TRADE', interval=60,
+                     start_datetime=start_date, end_datetime=end_date)
+    df10 = bquery.bdib('USOSFR10 BGN Curncy', event_type='TRADE', interval=60,
+                      start_datetime=start_date, end_datetime=end_date)
+    
+    # Process 5-year data
+    df5['time'] = pd.to_datetime(df5['time'])
+    df5['diff'] = df5['high'] - df5['low']
+    df5['returns'] = df5['close'].pct_change()
+    df5['instrument'] = 'USOSFR5'
+    
+    # Process 10-year data
+    df10['time'] = pd.to_datetime(df10['time'])
+    df10['diff'] = df10['high'] - df10['low']
+    df10['returns'] = df10['close'].pct_change()
+    df10['instrument'] = 'USOSFR10'
+    
+    # Combine both instruments
+    combined_df = pd.concat([df5[['time', 'high', 'low', 'close', 'diff', 'returns', 'instrument']],
+                           df10[['time', 'high', 'low', 'close', 'diff', 'returns', 'instrument']]])
+    
+    return combined_df
 
-# Load and prepare economic events
-def load_economic_events(filepath):
-    data = pd.read_csv(filepath)
-    data = data.rename(columns={
-        'Date Time': 'time',
-        'Country Code': 'country',
-        'Event': 'event',
-        'Ticker': 'ticker'
-    })
-    data['time'] = pd.to_datetime(data['time'], errors='coerce')
-    data = data[['time', 'country', 'event', 'ticker']].dropna(subset=['time'])
-    return data[data['country'] == 'US']
-
-# Calculate windowed volatility metrics
+# Modified window metrics calculation to handle multiple instruments
 def calculate_window_metrics(sofr_df, event_time, window_hours=5):
-    """
-    Calculate volatility metrics for a window around an event time
-    window_hours: total hours to consider (split evenly before/after event)
-    """
     half_window = window_hours / 2
     start_window = event_time - timedelta(hours=half_window)
     end_window = event_time + timedelta(hours=half_window)
@@ -46,67 +46,64 @@ def calculate_window_metrics(sofr_df, event_time, window_hours=5):
     if len(window_data) == 0:
         return None
     
-    # Calculate metrics
     window_data['hour_offset'] = (window_data['time'] - event_time).dt.total_seconds() / 3600
     
-    metrics = {
-        'max_diff': window_data['diff'].max(),
-        'total_range': window_data['high'].max() - window_data['low'].min(),
-        'avg_diff': window_data['diff'].mean(),
-        'volatility': window_data['returns'].std(),
-        'max_abs_return': window_data['returns'].abs().max(),
-        'event_impact': window_data['close'].iloc[-1] - window_data['close'].iloc[0]
-    }
+    # Calculate metrics for each instrument separately
+    metrics = {}
+    for instrument in window_data['instrument'].unique():
+        inst_data = window_data[window_data['instrument'] == instrument]
+        metrics[f'{instrument}_max_diff'] = inst_data['diff'].max()
+        metrics[f'{instrument}_total_range'] = inst_data['high'].max() - inst_data['low'].min()
+        metrics[f'{instrument}_avg_diff'] = inst_data['diff'].mean()
+        metrics[f'{instrument}_volatility'] = inst_data['returns'].std()
+        metrics[f'{instrument}_max_abs_return'] = inst_data['returns'].abs().max()
+        metrics[f'{instrument}_event_impact'] = inst_data['close'].iloc[-1] - inst_data['close'].iloc[0]
     
     return {**metrics, 'window_data': window_data}
 
-# Calculate baseline volatility characteristics
-def calculate_baseline_metrics(sofr_df, sample_size=1000, window_hours=5):
-    """Calculate baseline distribution of volatility metrics"""
-    baseline_metrics = []
-    available_times = sofr_df['time'].unique()
-    
-    for _ in range(sample_size):
-        random_time = pd.to_datetime(np.random.choice(available_times))  # Convert to Timestamp
-        metrics = calculate_window_metrics(sofr_df, random_time, window_hours)
-        if metrics:
-            baseline_metrics.append({k: v for k, v in metrics.items() if k != 'window_data'})
-    
-    return pd.DataFrame(baseline_metrics)
-
-# Score events against baseline
-def score_events(event_metrics_df, baseline_df):
-    """Score events based on how they compare to baseline volatility"""
-    scores = []
-    
-    for col in event_metrics_df.columns:
-        if col in baseline_df.columns:
-            # Calculate percentile vs baseline
-            scores.append(event_metrics_df[col].rank(pct=True).to_frame(col + '_score'))
-    
-    scores_df = pd.concat(scores, axis=1)
-    
-    # Composite score with weights
-    weights = {
-        'max_diff_score': 0.25,
-        'total_range_score': 0.25,
-        'volatility_score': 0.3,
-        'max_abs_return_score': 0.2
-    }
-    
-    scores_df['composite_score'] = sum(
-        scores_df[col] * weight for col, weight in weights.items()
+# Modified plotting functions
+def plot_event_impacts(window_data_df):
+    plt.figure(figsize=(16, 8))
+    sns.lineplot(
+        data=window_data_df,
+        x='hour_offset',
+        y='diff',
+        hue='event',
+        style='instrument',
+        ci=None,
+        estimator='median'
     )
-    
-    return scores_df
+    plt.title('SOFR Swap Rate Volatility Around Economic Events (5Y vs 10Y)')
+    plt.axvline(0, color='red', linestyle='--', label='Event Time')
+    plt.xlabel('Hours Relative to Event')
+    plt.ylabel('Price Range (High-Low)')
+    plt.legend(bbox_to_anchor=(1.05, 1))
+    plt.tight_layout()
+    plt.show()
 
-# Main analysis function
+def plot_top_events(results_df, window_data_df, n=5):
+    top_events = results_df.nlargest(n, 'composite_score')['event'].unique()
+    plot_data = window_data_df[window_data_df['event'].isin(top_events)]
+    
+    g = sns.FacetGrid(plot_data, col='event', row='instrument', height=4, aspect=1.5)
+    g.map_dataframe(
+        sns.lineplot,
+        x='hour_offset',
+        y='diff',
+        ci=None
+    )
+    g.set_titles('{row_name} | {col_name}')
+    g.set_axis_labels('Hours Relative to Event', 'Price Range')
+    for ax in g.axes.flat:
+        ax.axvline(0, color='red', linestyle='--')
+    plt.tight_layout()
+    plt.show()
+
+# Modified analysis function
 def analyze_events(sofr_df, events_df, window_hours=5):
-    # Calculate baseline metrics
     print("Calculating baseline volatility distribution...")
     baseline_df = calculate_baseline_metrics(sofr_df, window_hours=window_hours)
     
-    # Process each event
     print("Processing economic events...")
     all_event_metrics = []
     all_window_data = []
@@ -130,67 +127,38 @@ def analyze_events(sofr_df, events_df, window_hours=5):
     event_metrics_df = pd.DataFrame(all_event_metrics)
     window_data_df = pd.concat(all_window_data)
     
-    # Score events
     print("Scoring events...")
-    scores_df = score_events(event_metrics_df.drop(columns=['time', 'event', 'ticker']), baseline_df)
+    # Create composite score that considers both instruments
+    score_columns = [col for col in event_metrics_df.columns 
+                    if any(x in col for x in ['max_diff', 'volatility', 'max_abs_return'])]
+    
+    scores = []
+    for col in score_columns:
+        scores.append(event_metrics_df[col].rank(pct=True).to_frame(col + '_score'))
+    
+    scores_df = pd.concat(scores, axis=1)
+    
+    # Weighted composite score (giving equal weight to both instruments)
+    weights = {
+        'USOSFR5_max_diff_score': 0.15,
+        'USOSFR5_volatility_score': 0.2,
+        'USOSFR5_max_abs_return_score': 0.15,
+        'USOSFR10_max_diff_score': 0.15,
+        'USOSFR10_volatility_score': 0.2,
+        'USOSFR10_max_abs_return_score': 0.15
+    }
+    
+    scores_df['composite_score'] = sum(
+        scores_df[col] * weight for col, weight in weights.items()
+    )
+    
     results_df = pd.concat([
         event_metrics_df[['time', 'event', 'ticker']],
         event_metrics_df.drop(columns=['time', 'event', 'ticker']),
         scores_df
     ], axis=1)
     
-    # Calculate statistical significance
-    for metric in ['max_diff', 'volatility', 'max_abs_return']:
-        results_df[f'{metric}_pvalue'] = [
-            stats.percentileofscore(baseline_df[metric], x)/100 
-            for x in results_df[metric]
-        ]
-    
     return results_df, window_data_df, baseline_df
-
-# Visualization functions
-def plot_event_impacts(window_data_df):
-    plot_df = window_data_df.groupby(['hour_offset', 'event'])['diff'].mean().reset_index()
-    
-    plt.figure(figsize=(14, 8))
-    sns.lineplot(
-        data=plot_df,
-        x='hour_offset',
-        y='diff',
-        hue='event'
-    )
-    plt.title('SOFR 10Y Swap Rate Volatility Around Economic Events')
-    plt.axvline(0, color='red', linestyle='--', label='Event Time')
-    plt.xlabel('Hours Relative to Event')
-    plt.ylabel('Price Range (High-Low)')
-    plt.legend(bbox_to_anchor=(1.05, 1))
-    plt.tight_layout()
-    plt.show()
-
-def plot_top_events(results_df, window_data_df, n=5):
-    top_events = results_df.nlargest(n, 'composite_score')['event'].unique()
-    plot_data = window_data_df[window_data_df['event'].isin(top_events)]
-    
-    # Remove any problematic parameters that might be passed through
-    plot_kwargs = {
-        'x': 'hour_offset',
-        'y': 'diff',
-        'errorbar': None,  # Disable error bars to avoid the issue
-        'estimator': None  # Disable any aggregation
-    }
-    
-    g = sns.FacetGrid(plot_data, col='event', col_wrap=3, height=4, sharey=False)
-    g.map_dataframe(
-        sns.lineplot,
-        **plot_kwargs
-    )
-    g.set_titles('{col_name}')
-    g.set_axis_labels('Hours Relative to Event', 'Price Range')
-    for ax in g.axes.flat:
-        ax.axvline(0, color='red', linestyle='--')
-    plt.tight_layout()
-    plt.show()
-
 
 # Main execution
 if __name__ == '__main__':
@@ -215,7 +183,7 @@ if __name__ == '__main__':
     major_events = results_df[results_df['composite_score'] >= threshold]
     
     # Save and display results
-    major_events.to_csv('significant_economic_events.csv', index=False)
+    major_events.to_csv('significant_economic_events_comparison.csv', index=False)
     print(f"Found {len(major_events)} significant economic events:")
     print(major_events[['time', 'event', 'composite_score']].sort_values('composite_score', ascending=False))
     
