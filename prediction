@@ -1,0 +1,277 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV
+from sklearn.calibration import CalibratedClassifierCV
+import joblib
+
+def prepare_training_data(results_df, window_data_df, baseline_df):
+    """
+    Prepare the training data for our volatility prediction model.
+    
+    Args:
+        results_df: DataFrame from analyze_events() containing event metrics
+        window_data_df: DataFrame containing raw window data around events
+        baseline_df: DataFrame containing baseline volatility metrics
+    
+    Returns:
+        X: Features DataFrame
+        y: Target variable (1=high volatility, 0=low volatility)
+    """
+    # Create target variable - we'll define high volatility as top 20% of events
+    results_df['high_volatility'] = (results_df['composite_score'] >= 
+                                   results_df['composite_score'].quantile(0.8)).astype(int)
+    
+    # Feature engineering
+    features = results_df.copy()
+    
+    # 1. Event characteristics
+    features['is_fomc'] = features['event'].str.contains('FOMC', case=False).astype(int)
+    features['is_cpi'] = features['event'].str.contains('CPI', case=False).astype(int)
+    features['is_nfp'] = features['event'].str.contains('Nonfarm Payrolls|NFP', case=False).astype(int)
+    features['is_employment'] = features['event'].str.contains('Unemployment|Employment|Claims', case=False).astype(int)
+    features['is_manufacturing'] = features['event'].str.contains('PMI|ISM', case=False).astype(int)
+    
+    # 2. Market conditions before event (using SOFR5 as proxy)
+    def get_pre_event_market_conditions(row):
+        event_time = row['time']
+        pre_window = window_data_df[
+            (window_data_df['time'] >= event_time - pd.Timedelta(hours=2)) & 
+            (window_data_df['time'] < event_time) &
+            (window_data_df['instrument'] == 'USOSFR5')
+        ]
+        
+        if len(pre_window) == 0:
+            return pd.Series([np.nan]*4)
+        
+        return pd.Series([
+            pre_window['returns'].std(),  # pre-event volatility
+            pre_window['close'].iloc[-1] - pre_window['close'].iloc[0],  # pre-event drift
+            (pre_window['high'].max() - pre_window['low'].min()) / baseline_df['total_range'].median(),  # normalized range
+            pre_window['diff'].mean() / baseline_df['avg_diff'].median()  # normalized diff
+        ])
+    
+    conditions = features.apply(get_pre_event_market_conditions, axis=1)
+    conditions.columns = ['pre_volatility', 'pre_drift', 'pre_norm_range', 'pre_norm_diff']
+    features = pd.concat([features, conditions], axis=1)
+    
+    # 3. Time features
+    features['hour_of_day'] = features['time'].dt.hour
+    features['day_of_week'] = features['time'].dt.dayofweek
+    features['month'] = features['time'].dt.month
+    
+    # 4. Recent volatility context (using rolling 1-week baseline)
+    features['recent_volatility'] = features['time'].apply(
+        lambda x: baseline_df[
+            (baseline_df['time'] >= x - pd.Timedelta(days=7)) & 
+            (baseline_df['time'] < x)
+        ]['volatility'].mean()
+    )
+    
+    # Define features and target
+    feature_cols = [
+        'is_fomc', 'is_cpi', 'is_nfp', 'is_employment', 'is_manufacturing',
+        'pre_volatility', 'pre_drift', 'pre_norm_range', 'pre_norm_diff',
+        'hour_of_day', 'day_of_week', 'month', 'recent_volatility'
+    ]
+    
+    categorical_features = ['hour_of_day', 'day_of_week', 'month']
+    numeric_features = [f for f in feature_cols if f not in categorical_features]
+    
+    X = features[feature_cols]
+    y = features['high_volatility']
+    
+    return X, y, categorical_features, numeric_features
+
+def train_volatility_predictor(X, y, categorical_features, numeric_features):
+    """
+    Train a classifier to predict high volatility events.
+    
+    Returns:
+        pipeline: Trained sklearn pipeline
+        test_metrics: Dictionary of evaluation metrics
+    """
+    # Preprocessing
+    numeric_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='constant', fill_value=-1)),
+        ('onehot', OneHotEncoder(handle_unknown='ignore'))
+    ])
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numeric_transformer, numeric_features),
+            ('cat', categorical_transformer, categorical_features)
+        ])
+    
+    # Model pipeline
+    pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('classifier', GradientBoostingClassifier(random_state=42))
+    ])
+    
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    # Hyperparameter tuning
+    param_grid = {
+        'classifier__n_estimators': [100, 200],
+        'classifier__learning_rate': [0.05, 0.1],
+        'classifier__max_depth': [3, 5]
+    }
+    
+    search = GridSearchCV(
+        pipeline, param_grid, cv=5, scoring='roc_auc', n_jobs=-1
+    )
+    search.fit(X_train, y_train)
+    
+    # Calibrate probabilities
+    calibrated = CalibratedClassifierCV(search.best_estimator_, cv=5, method='isotonic')
+    calibrated.fit(X_train, y_train)
+    
+    # Evaluate
+    y_pred = calibrated.predict(X_test)
+    y_proba = calibrated.predict_proba(X_test)[:, 1]
+    
+    test_metrics = {
+        'classification_report': classification_report(y_test, y_pred),
+        'roc_auc': roc_auc_score(y_test, y_proba),
+        'best_params': search.best_params_
+    }
+    
+    return calibrated, test_metrics
+
+def predict_future_events(model, future_events_df, sofr_df, baseline_df):
+    """
+    Predict volatility impact for future economic events.
+    
+    Args:
+        model: Trained classifier
+        future_events_df: DataFrame of upcoming economic events with 'time' and 'event' columns
+        sofr_df: Current SOFR data for market condition features
+        baseline_df: Baseline volatility metrics
+    
+    Returns:
+        DataFrame with predictions and probabilities
+    """
+    # Prepare features for future events
+    X_future = future_events_df.copy()
+    
+    # Add the same features we used in training
+    X_future['is_fomc'] = X_future['event'].str.contains('FOMC', case=False).astype(int)
+    X_future['is_cpi'] = X_future['event'].str.contains('CPI', case=False).astype(int)
+    X_future['is_nfp'] = X_future['event'].str.contains('Nonfarm Payrolls|NFP', case=False).astype(int)
+    X_future['is_employment'] = X_future['event'].str.contains('Unemployment|Employment|Claims', case=False).astype(int)
+    X_future['is_manufacturing'] = X_future['event'].str.contains('PMI|ISM', case=False).astype(int)
+    
+    # Get current market conditions (using most recent 2 hours)
+    now = pd.Timestamp.now(tz='UTC')
+    recent_data = sofr_df[
+        (sofr_df['time'] >= now - pd.Timedelta(hours=2)) &
+        (sofr_df['instrument'] == 'USOSFR5')
+    ]
+    
+    if len(recent_data) > 0:
+        current_volatility = recent_data['returns'].std()
+        current_drift = recent_data['close'].iloc[-1] - recent_data['close'].iloc[0]
+        current_range = (recent_data['high'].max() - recent_data['low'].min()) / baseline_df['total_range'].median()
+        current_diff = recent_data['diff'].mean() / baseline_df['avg_diff'].median()
+    else:
+        # If no recent data, use median values
+        current_volatility = baseline_df['volatility'].median()
+        current_drift = 0
+        current_range = 1
+        current_diff = 1
+    
+    # Add market condition features
+    X_future['pre_volatility'] = current_volatility
+    X_future['pre_drift'] = current_drift
+    X_future['pre_norm_range'] = current_range
+    X_future['pre_norm_diff'] = current_diff
+    
+    # Add time features
+    X_future['hour_of_day'] = X_future['time'].dt.hour
+    X_future['day_of_week'] = X_future['time'].dt.dayofweek
+    X_future['month'] = X_future['time'].dt.month
+    
+    # Add recent volatility context
+    recent_baseline = baseline_df[
+        baseline_df['time'] >= now - pd.Timedelta(days=7)
+    ]
+    recent_vol = recent_baseline['volatility'].mean() if len(recent_baseline) > 0 else baseline_df['volatility'].median()
+    X_future['recent_volatility'] = recent_vol
+    
+    # Get feature columns in correct order
+    feature_cols = [
+        'is_fomc', 'is_cpi', 'is_nfp', 'is_employment', 'is_manufacturing',
+        'pre_volatility', 'pre_drift', 'pre_norm_range', 'pre_norm_diff',
+        'hour_of_day', 'day_of_week', 'month', 'recent_volatility'
+    ]
+    
+    # Make predictions
+    predictions = model.predict(X_future[feature_cols])
+    probabilities = model.predict_proba(X_future[feature_cols])[:, 1]
+    
+    # Create output DataFrame
+    results = X_future[['time', 'event']].copy()
+    results['high_volatility_prob'] = probabilities
+    results['predicted_high_vol'] = predictions
+    results['risk_category'] = pd.cut(
+        probabilities,
+        bins=[0, 0.3, 0.7, 1],
+        labels=['Low', 'Medium', 'High'],
+        include_lowest=True
+    )
+    
+    return results.sort_values('high_volatility_prob', ascending=False)
+
+def main():
+    # Load your existing data
+    results_df = pd.read_csv('significant_economic_events_comparison.csv')
+    window_data_df = pd.read_csv('window_data.csv')  # You'll need to save this from your analysis
+    baseline_df = pd.read_csv('baseline_metrics.csv')  # You'll need to save this from your analysis
+    
+    # Convert time columns
+    time_cols = ['time']
+    for df in [results_df, window_data_df, baseline_df]:
+        if 'time' in df.columns:
+            df['time'] = pd.to_datetime(df['time'])
+    
+    # Prepare training data
+    X, y, cat_features, num_features = prepare_training_data(results_df, window_data_df, baseline_df)
+    
+    # Train model
+    model, metrics = train_volatility_predictor(X, y, cat_features, num_features)
+    
+    print("Model performance on test set:")
+    print(metrics['classification_report'])
+    print(f"ROC AUC: {metrics['roc_auc']:.3f}")
+    
+    # Save model
+    joblib.dump(model, 'volatility_predictor.pkl')
+    
+    # Example: Predict for future events
+    future_events = pd.DataFrame([
+        {'time': pd.Timestamp('2025-04-25 08:30:00'), 'event': 'Nonfarm Payrolls'},
+        {'time': pd.Timestamp('2025-04-30 14:00:00'), 'event': 'FOMC Rate Decision'},
+        {'time': pd.Timestamp('2025-05-10 08:30:00'), 'event': 'CPI m/m'},
+        {'time': pd.Timestamp('2025-05-15 10:00:00'), 'event': 'ISM Manufacturing PMI'}
+    ])
+    
+    predictions = predict_future_events(model, future_events, sofr_df, baseline_df)
+    print("\nPredictions for future events:")
+    print(predictions)
+
+if __name__ == '__main__':
+    main()
