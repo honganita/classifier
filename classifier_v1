@@ -13,7 +13,7 @@ def load_sofr_data(bquery, start_date, end_date):
     df['time'] = pd.to_datetime(df['time'])
     df['diff'] = df['high'] - df['low']
     df['returns'] = df['close'].pct_change()  # Add returns for additional volatility measure
-    return df[['time', 'diff', 'returns']]
+    return df[['time', 'high', 'low', 'close', 'diff', 'returns']]  # Include all needed columns
 
 # Load and prepare economic events
 def load_economic_events(filepath):
@@ -67,7 +67,7 @@ def calculate_baseline_metrics(sofr_df, sample_size=1000, window_hours=5):
     available_times = sofr_df['time'].unique()
     
     for _ in range(sample_size):
-        random_time = np.random.choice(available_times)
+        random_time = pd.to_datetime(np.random.choice(available_times))  # Convert to Timestamp
         metrics = calculate_window_metrics(sofr_df, random_time, window_hours)
         if metrics:
             baseline_metrics.append({k: v for k, v in metrics.items() if k != 'window_data'})
