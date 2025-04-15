@@ -150,14 +150,14 @@ def analyze_events(sofr_df, events_df, window_hours=5):
 
 # Visualization functions
 def plot_event_impacts(window_data_df):
+    plot_df = window_data_df.groupby(['hour_offset', 'event'])['diff'].mean().reset_index()
+    
     plt.figure(figsize=(14, 8))
     sns.lineplot(
-        data=window_data_df,
+        data=plot_df,
         x='hour_offset',
         y='diff',
-        hue='event',
-        ci=95,  # Changed from errorbar=('ci', 95) to ci=95
-        estimator='median'
+        hue='event'
     )
     plt.title('SOFR 10Y Swap Rate Volatility Around Economic Events')
     plt.axvline(0, color='red', linestyle='--', label='Event Time')
