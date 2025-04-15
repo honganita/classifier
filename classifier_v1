@@ -156,10 +156,10 @@ def plot_event_impacts(window_data_df):
         x='hour_offset',
         y='diff',
         hue='event',
-        errorbar=('ci', 95),
+        ci=95,  # Changed from errorbar=('ci', 95) to ci=95
         estimator='median'
     )
-    plt.title(f'SOFR 10Y Swap Rate Volatility Around Economic Events')
+    plt.title('SOFR 10Y Swap Rate Volatility Around Economic Events')
     plt.axvline(0, color='red', linestyle='--', label='Event Time')
     plt.xlabel('Hours Relative to Event')
     plt.ylabel('Price Range (High-Low)')
