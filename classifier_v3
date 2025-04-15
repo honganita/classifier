@@ -1,0 +1,507 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import pytz
+from scipy import stats
+from concurrent.futures import ThreadPoolExecutor
+import warnings
+from tqdm import tqdm
+import blp  # Bloomberg API wrapper
+
+# Configuration
+INSTRUMENTS = {
+    'USOSFR5 BGN Curncy': {'type': 'swap', 'tenor': '5Y', 'field': 'PX_LAST'},
+    'USOSFR10 BGN Curncy': {'type': 'swap', 'tenor': '10Y', 'field': 'PX_LAST'},
+    'SPX Index': {'type': 'equity', 'tenor': None, 'field': 'LAST_PRICE'}
+}
+WINDOW_HOURS = 5  # Total analysis window (symmetrical around event)
+BASELINE_SAMPLES = 1000  # Number of random samples for baseline
+EVENT_SCORE_THRESHOLD = 0.9  # 90th percentile for significant events
+TIMEZONE = 'America/New_York'  # Timezone for market data
+
+class EconomicEventClassifier:
+    def __init__(self, bquery):
+        self.bquery = bquery
+        self.data_cache = {}
+        self.baseline_cache = {}
+        
+    def safe_convert_datetime(self, dt_series):
+        """Safely convert datetime series with comprehensive error handling"""
+        try:
+            # First try direct conversion
+            result = pd.to_datetime(dt_series)
+            if not result.isna().all():
+                return result
+            
+            # Try alternative formats if first attempt fails
+            for fmt in ['%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S', '%Y-%m-%d', '%m/%d/%Y']:
+                try:
+                    result = pd.to_datetime(dt_series, format=fmt)
+                    if not result.isna().all():
+                        return result
+                except:
+                    continue
+            
+            # Final fallback with coerce
+            return pd.to_datetime(dt_series, errors='coerce')
+        except Exception as e:
+            warnings.warn(f"Datetime conversion failed: {str(e)}")
+            return pd.Series([pd.NaT] * len(dt_series))
+    
+    def fetch_instrument_data(self, ticker, start_date, end_date):
+        """Fetch Bloomberg data for a single instrument with robust error handling"""
+        try:
+            print(f"Fetching data for {ticker}...")
+            df = self.bquery.bdib(
+                ticker=ticker,
+                event_type='TRADE',
+                interval=60,
+                start_datetime=start_date,
+                end_datetime=end_date
+            )
+            
+            if df.empty:
+                warnings.warn(f"No data returned for {ticker}")
+                return None
+                
+            # Standardize column names and handle datetime conversion
+            df['time'] = self.safe_convert_datetime(df['time'])
+            df = df.dropna(subset=['time']).sort_values('time')
+            
+            # Convert to Eastern Time (market timezone)
+            df['time'] = df['time'].dt.tz_localize('UTC').dt.tz_convert(TIMEZONE)
+            
+            # Calculate volatility metrics
+            df['returns'] = df['close'].pct_change()
+            df['range'] = df['high'] - df['low']
+            df['log_returns'] = np.log(df['close']).diff()
+            
+            # Add additional metrics
+            df['intraday_volatility'] = df['returns'].rolling(4).std()  # 4-hour rolling vol
+            df['overnight_gap'] = df['open'] - df['close'].shift(1)
+            
+            # Store in cache
+            self.data_cache[ticker] = df
+            return df
+            
+        except Exception as e:
+            warnings.warn(f"Error fetching {ticker}: {str(e)}")
+            return None
+    
+    def fetch_all_instruments(self, start_date, end_date):
+        """Parallel fetch for all instruments with progress tracking"""
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                ticker: executor.submit(
+                    self.fetch_instrument_data,
+                    ticker, start_date, end_date
+                )
+                for ticker in INSTRUMENTS
+            }
+            
+            results = {}
+            for ticker, future in tqdm(futures.items(), desc="Fetching instruments"):
+                try:
+                    results[ticker] = future.result(timeout=300)  # 5 minute timeout
+                except Exception as e:
+                    warnings.warn(f"Timeout or error processing {ticker}: {str(e)}")
+                    results[ticker] = None
+                
+        return {k: v for k, v in results.items() if v is not None}
+    
+    def calculate_window_metrics(self, ticker, event_time):
+        """Calculate volatility metrics for a window around an event with robust datetime handling"""
+        df = self.data_cache.get(ticker)
+        if df is None or df.empty:
+            return None
+            
+        try:
+            # Ensure event_time is proper datetime and in correct timezone
+            if not isinstance(event_time, pd.Timestamp):
+                event_time = pd.to_datetime(event_time)
+            if event_time.tzinfo is None:
+                event_time = event_time.tz_localize(TIMEZONE)
+            elif event_time.tzinfo != pytz.timezone(TIMEZONE):
+                event_time = event_time.tz_convert(TIMEZONE)
+                
+            half_window = WINDOW_HOURS / 2
+            start_window = event_time - pd.Timedelta(hours=half_window)
+            end_window = event_time + pd.Timedelta(hours=half_window)
+            
+            # Filter window data
+            window_data = df[
+                (df['time'] >= start_window) & 
+                (df['time'] <= end_window)
+            ].copy()
+            
+            if len(window_data) < 3:  # Need at least 3 data points
+                return None
+                
+            # Calculate hour offsets using nanoseconds for precision
+            window_data['hour_offset'] = (
+                (window_data['time'].astype('int64') - event_time.value) / 1e9 / 3600
+            )
+            
+            # Calculate various volatility metrics
+            metrics = {
+                'max_range': window_data['range'].max(),
+                'total_range': window_data['high'].max() - window_data['low'].min(),
+                'avg_range': window_data['range'].mean(),
+                'returns_volatility': window_data['returns'].std(),
+                'log_returns_volatility': window_data['log_returns'].std(),
+                'max_abs_return': window_data['returns'].abs().max(),
+                'event_impact': window_data['close'].iloc[-1] - window_data['close'].iloc[0],
+                'intraday_volatility': window_data['intraday_volatility'].mean(),
+                'overnight_gap': window_data['overnight_gap'].mean(),
+                'z_score': self.calculate_z_score(ticker, window_data),
+                'data_points': len(window_data)
+            }
+            
+            return {**metrics, 'window_data': window_data}
+            
+        except Exception as e:
+            warnings.warn(f"Error processing window for {ticker} at {event_time}: {str(e)}")
+            return None
+    
+    def calculate_baseline_metrics(self, ticker):
+        """Calculate baseline distribution of volatility metrics with caching"""
+        if ticker in self.baseline_cache:
+            return self.baseline_cache[ticker]
+            
+        df = self.data_cache.get(ticker)
+        if df is None or df.empty:
+            return pd.DataFrame()
+            
+        available_times = df['time'].between(
+            df['time'].min() + pd.Timedelta(days=7),  # Skip first week
+            df['time'].max() - pd.Timedelta(days=7)   # Skip last week
+        )
+        valid_times = df.loc[available_times, 'time'].unique()
+        
+        if len(valid_times) == 0:
+            return pd.DataFrame()
+        
+        baseline_metrics = []
+        for _ in tqdm(range(BASELINE_SAMPLES), desc=f"Calculating baseline for {ticker}"):
+            random_time = np.random.choice(valid_times)
+            metrics = self.calculate_window_metrics(ticker, random_time)
+            if metrics:
+                baseline_metrics.append({k: v for k, v in metrics.items() if k != 'window_data'})
+        
+        baseline_df = pd.DataFrame(baseline_metrics)
+        self.baseline_cache[ticker] = baseline_df
+        return baseline_df
+    
+    def calculate_z_score(self, ticker, window_data):
+        """Calculate how unusual this window's volatility is compared to baseline"""
+        baseline_df = self.calculate_baseline_metrics(ticker)
+        if baseline_df.empty:
+            return np.nan
+            
+        current_vol = window_data['log_returns'].std()
+        baseline_vol = baseline_df['log_returns_volatility']
+        
+        if baseline_vol.std() == 0 or np.isnan(current_vol):
+            return np.nan
+            
+        return (current_vol - baseline_vol.mean()) / baseline_vol.std()
+    
+    def analyze_event(self, event_time, event_name, event_ticker=None):
+        """Analyze an event across all instruments with comprehensive error handling"""
+        results = {}
+        
+        # Convert and validate event time
+        try:
+            event_time = self.safe_convert_datetime(pd.Series([event_time])).iloc[0]
+            if pd.isna(event_time):
+                return None
+            if event_time.tzinfo is None:
+                event_time = event_time.tz_localize(TIMEZONE)
+        except Exception as e:
+            warnings.warn(f"Invalid event time {event_time}: {str(e)}")
+            return None
+        
+        for ticker, df in self.data_cache.items():
+            try:
+                metrics = self.calculate_window_metrics(ticker, event_time)
+                if not metrics:
+                    continue
+                    
+                window_data = metrics.pop('window_data')
+                window_data['event'] = event_name
+                window_data['ticker'] = ticker
+                
+                # Score against baseline
+                baseline_df = self.calculate_baseline_metrics(ticker)
+                if not baseline_df.empty:
+                    for metric in ['max_range', 'returns_volatility', 'max_abs_return', 'intraday_volatility']:
+                        if metric in metrics and metric in baseline_df.columns:
+                            metrics[f'{metric}_percentile'] = stats.percentileofscore(
+                                baseline_df[metric], metrics[metric]
+                            ) / 100
+                
+                results[ticker] = {
+                    'metrics': metrics,
+                    'window_data': window_data
+                }
+                
+            except Exception as e:
+                warnings.warn(f"Error processing {ticker} for event {event_name}: {str(e)}")
+                continue
+                
+        return results
+    
+    def score_event(self, event_results):
+        """Create a composite score for the event across instruments"""
+        if not event_results:
+            return None
+            
+        scores = []
+        weights = {
+            'max_range_percentile': 0.25,
+            'returns_volatility_percentile': 0.3,
+            'max_abs_return_percentile': 0.2,
+            'intraday_volatility_percentile': 0.15,
+            'z_score': 0.1
+        }
+        
+        for ticker, result in event_results.items():
+            metrics = result['metrics']
+            ticker_type = INSTRUMENTS[ticker]['type']
+            
+            # Calculate instrument-specific score
+            instrument_score = 0
+            valid_weights = 0
+            for metric, weight in weights.items():
+                if metric in metrics and not np.isnan(metrics[metric]):
+                    instrument_score += metrics[metric] * weight
+                    valid_weights += weight
+            
+            if valid_weights > 0:
+                instrument_score /= valid_weights
+                scores.append({
+                    'ticker': ticker,
+                    'type': ticker_type,
+                    'score': instrument_score,
+                    'z_score': metrics.get('z_score', np.nan),
+                    'data_points': metrics.get('data_points', 0)
+                })
+        
+        if not scores:
+            return None
+            
+        # Cross-asset confirmation bonus
+        confirmed_by = sum(1 for s in scores if s['score'] >= 0.7 and s['data_points'] >= 3)
+        confirmation_bonus = min(0.2, confirmed_by * 0.05)
+        
+        # Calculate final composite score
+        avg_score = np.mean([s['score'] for s in scores])
+        composite_score = min(1.0, avg_score + confirmation_bonus)
+        
+        return {
+            'composite_score': composite_score,
+            'instrument_scores': scores,
+            'confirmed_by': confirmed_by,
+            'instruments_available': len(scores)
+        }
+    
+    def run_analysis(self, events_df, start_date, end_date):
+        """Main analysis workflow with comprehensive logging"""
+        print(f"Starting analysis from {start_date} to {end_date}")
+        
+        # Fetch all instrument data
+        print("Fetching market data...")
+        self.fetch_all_instruments(start_date, end_date)
+        if not self.data_cache:
+            raise ValueError("No instrument data available for analysis")
+        
+        # Prepare events dataframe
+        events_df = events_df.copy()
+        events_df['time'] = self.safe_convert_datetime(events_df['time'])
+        events_df = events_df.dropna(subset=['time'])
+        
+        # Process each event
+        all_results = []
+        all_window_data = []
+        
+        for _, event in tqdm(events_df.iterrows(), total=len(events_df), desc="Analyzing events"):
+            event_results = self.analyze_event(event['time'], event['event'], event.get('ticker'))
+            if not event_results:
+                continue
+                
+            # Score the event
+            event_score = self.score_event(event_results)
+            if not event_score:
+                continue
+                
+            # Collect window data for visualization
+            for ticker, result in event_results.items():
+                result['window_data']['event_id'] = len(all_results)
+                all_window_data.append(result['window_data'])
+            
+            # Store results
+            all_results.append({
+                'time': event['time'],
+                'event': event['event'],
+                'ticker': event.get('ticker'),
+                **event_score
+            })
+        
+        # Combine results
+        results_df = pd.DataFrame(all_results)
+        window_data_df = pd.concat(all_window_data) if all_window_data else pd.DataFrame()
+        
+        # Identify significant events
+        if not results_df.empty:
+            threshold = results_df['composite_score'].quantile(EVENT_SCORE_THRESHOLD)
+            major_events = results_df[results_df['composite_score'] >= threshold].copy()
+            
+            # Add significance ranking
+            major_events['significance_rank'] = major_events['composite_score'].rank(ascending=False)
+        else:
+            major_events = pd.DataFrame()
+        
+        return results_df, window_data_df, major_events
+
+def plot_cross_instrument_impact(window_data_df, top_n=5):
+    """Enhanced visualization of event impacts across instruments"""
+    if window_data_df.empty:
+        print("No window data available for visualization")
+        return
+        
+    # Get top events by max range across all instruments
+    top_events = (window_data_df.groupby(['event', 'event_id'])['range']
+                  .max()
+                  .sort_values(ascending=False)
+                  .head(top_n)
+                  .reset_index()['event_id'])
+    
+    plot_data = window_data_df[window_data_df['event_id'].isin(top_events)]
+    
+    plt.figure(figsize=(14, 10))
+    g = sns.FacetGrid(
+        plot_data,
+        row='ticker',
+        col='event',
+        hue='event',
+        height=3,
+        aspect=1.5,
+        sharey=False,
+        margin_titles=True
+    )
+    g.map_dataframe(
+        sns.lineplot,
+        x='hour_offset',
+        y='returns',
+        estimator=np.median,
+        errorbar=('ci', 95),
+        linewidth=2
+    )
+    g.set_titles('{row_name} | {col_name}')
+    g.set_axis_labels('Hours Relative to Event', 'Returns (%)')
+    for ax in g.axes.flat:
+        ax.axvline(0, color='red', linestyle='--', alpha=0.7)
+        ax.axhline(0, color='black', linestyle='-', alpha=0.3)
+        ax.grid(True, alpha=0.3)
+    plt.suptitle('Top Event Impacts Across Instruments', y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+def plot_event_heatmap(results_df, score_threshold=0.7):
+    """Enhanced heatmap visualization of event scores"""
+    if results_df.empty:
+        print("No results available for heatmap")
+        return
+        
+    # Filter for significant events
+    sig_events = results_df[results_df['composite_score'] >= score_threshold]
+    if sig_events.empty:
+        print(f"No events meet the score threshold of {score_threshold}")
+        return
+    
+    # Prepare pivot table
+    heatmap_data = sig_events.pivot_table(
+        index='event',
+        columns='ticker',
+        values='composite_score',
+        aggfunc=np.mean
+    ).sort_index(ascending=False)
+    
+    # Plot
+    plt.figure(figsize=(14, 8))
+    sns.heatmap(
+        heatmap_data,
+        annot=True,
+        cmap='RdYlGn',
+        vmin=score_threshold,
+        vmax=1.0,
+        linewidths=0.5,
+        linecolor='lightgray',
+        cbar_kws={'label': 'Composite Impact Score'}
+    )
+    plt.title(f'Event Impact Scores (Threshold = {score_threshold})', pad=20)
+    plt.xlabel('Instrument')
+    plt.ylabel('Economic Event')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+def save_results(results_df, window_data_df, major_events, prefix=''):
+    """Save results with timestamped filenames"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    if not results_df.empty:
+        results_df.to_csv(f'{prefix}event_results_{timestamp}.csv', index=False)
+    if not window_data_df.empty:
+        window_data_df.to_csv(f'{prefix}window_data_{timestamp}.csv', index=False)
+    if not major_events.empty:
+        major_events.to_csv(f'{prefix}major_events_{timestamp}.csv', index=False)
+
+if __name__ == '__main__':
+    try:
+        # Initialize Bloomberg connection
+        bquery = blp.BlpQuery(
+            host='usvxapificcl01.sdi.corp.bankofamerica.com',
+            port=8194,
+            uuid=32348716,
+            ip='165.40.198.238'
+        ).start()
+        
+        # Initialize classifier
+        classifier = EconomicEventClassifier(bquery)
+        
+        # Load economic events
+        events_df = pd.read_csv('economic_events.csv')
+        events_df['time'] = classifier.safe_convert_datetime(events_df['time'])
+        events_df = events_df.dropna(subset=['time'])
+        events_df = events_df[events_df['country'] == 'US']
+        
+        # Run analysis
+        start_date = '2024-01-01'
+        end_date = '2024-12-31'
+        
+        results_df, window_data_df, major_events = classifier.run_analysis(
+            events_df,
+            start_date,
+            end_date
+        )
+        
+        # Save and display results
+        save_results(results_df, window_data_df, major_events)
+        
+        if not major_events.empty:
+            print(f"\nFound {len(major_events)} significant events:")
+            print(major_events[['time', 'event', 'composite_score', 'confirmed_by', 'significance_rank']]
+                  .sort_values('significance_rank'))
+            
+            # Visualizations
+            plot_cross_instrument_impact(window_data_df)
+            plot_event_heatmap(results_df)
+        else:
+            print("No significant events found in the analysis period.")
+            
+    except Exception as e:
+        print(f"Error in main execution: {str(e)}")
+        raise
