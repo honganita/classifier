@@ -1,0 +1,195 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import pytz
+from scipy import stats
+
+# 1. Enhanced data loading with NFP detection
+def load_sofr_data(bquery, start_date, end_date):
+    # Load both 5-year and 10-year SOFR swaps
+    df5 = bquery.bdib('USOSFR5 BGN Curncy', event_type='TRADE', interval=60,
+                     start_datetime=start_date, end_datetime=end_date)
+    df10 = bquery.bdib('USOSFR10 BGN Curncy', event_type='TRADE', interval=60,
+                      start_datetime=start_date, end_datetime=end_date)
+    
+    # Process data
+    for df, inst in zip([df5, df10], ['USOSFR5', 'USOSFR10']):
+        df['time'] = pd.to_datetime(df['time'])
+        df['diff'] = df['high'] - df['low']
+        df['returns'] = df['close'].pct_change()
+        df['instrument'] = inst
+    
+    return pd.concat([df5, df10])
+
+# 2. Modified event window calculation (5 hours after only)
+def calculate_window_metrics(sofr_df, event_time):
+    start_window = event_time
+    end_window = event_time + timedelta(hours=5)
+    
+    window_data = sofr_df[
+        (sofr_df['time'] >= start_window) & 
+        (sofr_df['time'] <= end_window)
+    ].copy()
+    
+    if len(window_data) == 0:
+        return None
+    
+    window_data['hour_offset'] = (window_data['time'] - event_time).dt.total_seconds() / 3600
+    
+    metrics = {}
+    for instrument in window_data['instrument'].unique():
+        inst_data = window_data[window_data['instrument'] == instrument]
+        metrics.update({
+            f'{instrument}_max_diff': inst_data['diff'].max(),
+            f'{instrument}_avg_diff': inst_data['diff'].mean(),
+            f'{instrument}_volatility': inst_data['returns'].std(),
+            f'{instrument}_event_impact': inst_data['close'].iloc[-1] - inst_data['close'].iloc[0]
+        })
+    
+    return {**metrics, 'window_data': window_data}
+
+# 3. New function to standardize event names (group recurring events)
+def standardize_event_names(events_df):
+    # Map similar events to standardized names
+    event_mapping = {
+        r'.*Non[- ]?Farm Payroll.*': 'NFP',
+        r'.*Employment Situation.*': 'NFP',
+        r'.*FOMC.*Decision.*': 'FOMC Decision',
+        r'.*CPI.*': 'CPI Release',
+        r'.*Consumer Price Index.*': 'CPI Release',
+        r'.*PCE.*': 'PCE Release',
+        r'.*GDP.*': 'GDP Release'
+    }
+    
+    events_df['event_type'] = events_df['event']
+    for pattern, standardized_name in event_mapping.items():
+        events_df.loc[events_df['event'].str.contains(pattern, case=False), 'event_type'] = standardized_name
+    
+    return events_df
+
+# 4. Revised analysis function with event grouping
+def analyze_events(sofr_df, events_df):
+    # Standardize and filter events
+    events_df = standardize_event_names(events_df)
+    events_df = events_df[events_df['event_type'].notna()]
+    
+    # Process each event
+    all_window_data = []
+    event_metrics = []
+    
+    for _, event in events_df.iterrows():
+        metrics = calculate_window_metrics(sofr_df, event['time'])
+        if metrics:
+            window_data = metrics.pop('window_data')
+            window_data['event_type'] = event['event_type']
+            all_window_data.append(window_data)
+            event_metrics.append({**metrics, 'event_type': event['event_type']})
+    
+    # Aggregate by event type
+    metrics_df = pd.DataFrame(event_metrics)
+    grouped_metrics = metrics_df.groupby('event_type').agg(['mean', 'count'])
+    
+    # Filter events with at least 3 occurrences
+    valid_events = grouped_metrics[grouped_metrics[('USOSFR5_max_diff', 'count')] >= 3].index
+    filtered_metrics = metrics_df[metrics_df['event_type'].isin(valid_events)]
+    
+    # Calculate composite scores
+    score_columns = [col for col in filtered_metrics.columns 
+                    if col != 'event_type' and not col.endswith('_count')]
+    
+    scores = filtered_metrics.groupby('event_type')[score_columns].mean()
+    for col in score_columns:
+        scores[f'{col}_score'] = scores[col].rank(pct=True)
+    
+    # Weighted composite score
+    weights = {
+        'USOSFR5_max_diff_score': 0.3,
+        'USOSFR5_volatility_score': 0.2,
+        'USOSFR10_max_diff_score': 0.3,
+        'USOSFR10_volatility_score': 0.2
+    }
+    scores['composite_score'] = sum(scores[col] * weight for col, weight in weights.items())
+    
+    # Prepare final outputs
+    window_data_df = pd.concat(all_window_data)
+    results_df = scores.sort_values('composite_score', ascending=False).reset_index()
+    
+    return results_df, window_data_df
+
+# 5. Enhanced visualization functions
+def plot_event_impacts(results_df, window_data_df):
+    # Get top 20% events
+    threshold = results_df['composite_score'].quantile(0.8)
+    top_events = results_df[results_df['composite_score'] >= threshold]['event_type']
+    
+    # Prepare data
+    plot_data = window_data_df[window_data_df['event_type'].isin(top_events)]
+    plot_data = plot_data.groupby(['hour_offset', 'event_type', 'instrument'])['diff'].mean().reset_index()
+    
+    # Plot
+    plt.figure(figsize=(16, 8))
+    sns.lineplot(
+        data=plot_data,
+        x='hour_offset',
+        y='diff',
+        hue='event_type',
+        style='instrument',
+        markers=True
+    )
+    plt.title('Top 20% Economic Events: 5Y vs 10Y SOFR Volatility (5 Hours Post-Event)')
+    plt.xlabel('Hours After Event')
+    plt.ylabel('Average Price Range (bps)')
+    plt.legend(bbox_to_anchor=(1.05, 1))
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_event_comparison(results_df):
+    # Prepare data
+    plot_df = results_df.melt(id_vars=['event_type'], 
+                            value_vars=['USOSFR5_max_diff', 'USOSFR10_max_diff'],
+                            var_name='Tenor', value_name='Volatility')
+    plot_df['Tenor'] = plot_df['Tenor'].str.replace('_max_diff', '')
+    
+    # Plot
+    plt.figure(figsize=(12, 6))
+    sns.barplot(
+        data=plot_df,
+        x='event_type',
+        y='Volatility',
+        hue='Tenor',
+        order=results_df.sort_values('composite_score', ascending=False)['event_type']
+    )
+    plt.title('Average Maximum Volatility by Event Type')
+    plt.xlabel('')
+    plt.ylabel('Basis Points')
+    plt.xticks(rotation=45, ha='right')
+    plt.legend(title='Tenor')
+    plt.tight_layout()
+    plt.show()
+
+# Main execution
+if __name__ == '__main__':
+    # Initialize connection
+    bquery = blp.BlpQuery().start()  # Your connection details
+    
+    # Load data
+    sofr_df = load_sofr_data(bquery, '2024-09-26', '2025-04-11')
+    events_df = pd.read_csv('half_year_data.csv')
+    
+    # Analyze events
+    results_df, window_data_df = analyze_events(sofr_df, events_df)
+    
+    # Save and display results
+    top_20_percent = results_df[results_df['composite_score'] >= results_df['composite_score'].quantile(0.8)]
+    top_20_percent.to_csv('top_20_percent_events.csv', index=False)
+    
+    print("Top 20% Economic Events by Average Impact:")
+    print(top_20_percent[['event_type', 'composite_score', 
+                         'USOSFR5_max_diff', 'USOSFR10_max_diff']])
+    
+    # Visualizations
+    plot_event_impacts(results_df, window_data_df)
+    plot_event_comparison(results_df)
