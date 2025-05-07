@@ -1,0 +1,63 @@
+from datetime import datetime, timedelta
+import pytz
+import blp
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Initialize Bloomberg query
+today = datetime.now(pytz.timezone('Asia/Hong_Kong'))
+bquery = blp.BlpQuery(host='usvxapificcl01.sdi.corp.bankofamerica.com', port=8194, uuid=32348716, ip='165.40.198.238').start()
+
+# Fetch data from Bloomberg
+df = bquery.bdib('USOSFR10 BGN Curncy', event_type='TRADE', interval=60, start_datetime='2024-09-26', end_datetime='2025-04-11')
+df1 = df.copy()
+df['diff'] = df1['high'] - df1['low']
+columns = ['time', 'high', 'low', 'diff']
+df = df[columns]
+
+# Load and preprocess event data
+data = pd.read_csv('half_year_data.csv')
+data = data.rename(columns={'Date Time': 'time', 'Country Code': 'c', 'Event': 'event', 'Period': 'period', 'Ticker': 'ticker', 'S': 's'})
+columns = ['time', 'c', 'event', 'ticker']
+data['time'] = pd.to_datetime(data['time'], errors='coerce')
+data['time'] = data['time'].fillna(pd.to_datetime(data['time'].dropna().dt.strftime('%m/%d/%Y 00:00')))
+data = data[columns]
+data = data.dropna(subset=['time'])
+data = data[data['c'] == 'US']
+
+# Expand the time window to include the following 5 hours after the event
+data_expanded = pd.concat([data.assign(time=data['time'] + pd.Timedelta(hours=i)) for i in range(6)], ignore_index=True)
+
+# Merge dataframes to get the price differences
+merged_df = pd.merge(data_expanded, df, on=['time'], how='inner')
+
+# Calculate event volatility
+event_volatility = merged_df.groupby('event').agg(
+    highest_high=pd.NamedAgg(column='high', aggfunc='max'),
+    lowest_low=pd.NamedAgg(column='low', aggfunc='min')
+).reset_index()
+
+event_volatility['volatility'] = event_volatility['highest_high'] - event_volatility['lowest_low']
+
+# Sort events by volatility
+event_analysis = event_volatility.sort_values(by='volatility', ascending=False)
+
+# Determine the top 20% major events
+threshold = event_analysis['volatility'].quantile(0.8)
+major_events = event_analysis[event_analysis['volatility'] >= threshold]
+
+# Print and save major events
+print("Major Events Driving the SOFR 10y Rate:")
+print(major_events)
+major_events.to_csv('US_major_event.csv')
+
+# Plot the distribution of volatilities
+plt.figure(figsize=(10, 6))
+sns.histplot(event_analysis['volatility'], bins=20, kde=True, color='blue')
+plt.title('Distribution of Volatility (SOFR 10y Rate)', fontsize=14)
+plt.xlabel('Volatility')
+plt.ylabel('Frequency')
+plt.grid(alpha=0.3)
+plt.show()
