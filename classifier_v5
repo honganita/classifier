@@ -61,3 +61,82 @@ plt.xlabel('Volatility')
 plt.ylabel('Frequency')
 plt.grid(alpha=0.3)
 plt.show()
+Key Changes:
+Interval Expansion: The data_expanded now includes the following 5 hours for each event using a loop that adds one hour at a time from the original event time up to 5 hours later.
+
+Volatility Calculation: The event_volatility dataframe is created to calculate the volatility as the difference between the highest high and the lowest low for each event.
+
+Sorting and Filtering: Events are sorted by volatility, and the top 20% are selected using the quantile method.
+
+This should address the changes you wanted to make in your event analysis code.
+
+can you wrap this into a function, so that i can apply to different country and different curves, such as country = aud, curve = aud 10y swap, and country = jpy, curve = jpy 10y swap curve, and save the output of the top 20% event
+Certainly! You can encapsulate the logic into a function that takes parameters for the country code, curve name, and other relevant details. Here is how you can do it:
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import pytz
+import blp
+
+def analyze_events(country_code, curve_name, start_date, end_date, output_filename):
+    # Initialize Bloomberg query
+    today = datetime.now(pytz.timezone('Asia/Hong_Kong'))
+    bquery = blp.BlpQuery(host='usvxapificcl01.sdi.corp.bankofamerica.com', port=8194, uuid=32348716, ip='165.40.198.238').start()
+
+    # Fetch data from Bloomberg
+    df = bquery.bdib(curve_name, event_type='TRADE', interval=60, start_datetime=start_date, end_datetime=end_date)
+    df1 = df.copy()
+    df['diff'] = df1['high'] - df1['low']
+    columns = ['time', 'high', 'low', 'diff']
+    df = df[columns]
+
+    # Load and preprocess event data
+    data = pd.read_csv('half_year_data.csv')
+    data = data.rename(columns={'Date Time': 'time', 'Country Code': 'c', 'Event': 'event', 'Period': 'period', 'Ticker': 'ticker', 'S': 's'})
+    columns = ['time', 'c', 'event', 'ticker']
+    data['time'] = pd.to_datetime(data['time'], errors='coerce')
+    data['time'] = data['time'].fillna(pd.to_datetime(data['time'].dropna().dt.strftime('%m/%d/%Y 00:00')))
+    data = data[columns]
+    data = data.dropna(subset=['time'])
+    data = data[data['c'] == country_code]
+
+    # Expand the time window to include the following 5 hours after the event
+    data_expanded = pd.concat([data.assign(time=data['time'] + pd.Timedelta(hours=i)) for i in range(6)], ignore_index=True)
+
+    # Merge dataframes to get the price differences
+    merged_df = pd.merge(data_expanded, df, on=['time'], how='inner')
+
+    # Calculate event volatility
+    event_volatility = merged_df.groupby('event').agg(
+        highest_high=pd.NamedAgg(column='high', aggfunc='max'),
+        lowest_low=pd.NamedAgg(column='low', aggfunc='min')
+    ).reset_index()
+
+    event_volatility['volatility'] = event_volatility['highest_high'] - event_volatility['lowest_low']
+
+    # Sort events by volatility
+    event_analysis = event_volatility.sort_values(by='volatility', ascending=False)
+
+    # Determine the top 20% major events
+    threshold = event_analysis['volatility'].quantile(0.8)
+    major_events = event_analysis[event_analysis['volatility'] >= threshold]
+
+    # Print and save major events
+    print(f"Major Events Driving the {curve_name}:")
+    print(major_events)
+    major_events.to_csv(output_filename)
+
+    # Plot the distribution of volatilities
+    plt.figure(figsize=(10, 6))
+    sns.histplot(event_analysis['volatility'], bins=20, kde=True, color='blue')
+    plt.title(f'Distribution of Volatility ({curve_name})', fontsize=14)
+    plt.xlabel('Volatility')
+    plt.ylabel('Frequency')
+    plt.grid(alpha=0.3)
+    plt.show()
+
+# Example usage
+analyze_events(country_code='US', curve_name='USOSFR10 BGN Curncy', start_date='2024-09-26', end_date='2025-04-11', output_filename='US_major_event.csv')
