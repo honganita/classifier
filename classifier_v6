@@ -1,0 +1,79 @@
+import pandas as pd
+import numpy as np
+import blp
+from datetime import datetime
+import pytz
+
+def filter_future_high_volatility_events(country_code, curve_name, start_date, end_date, output_filename, future_data_filename):
+    # Initialize Bloomberg query
+    today = datetime.now(pytz.timezone('Asia/Hong_Kong'))
+    bquery = blp.BlpQuery(host='usvxapificcl01.sdi.corp.bankofamerica.com', port=8194, uuid=32348716, ip='165.40.198.238').start()
+
+    # Fetch data from Bloomberg
+    df = bquery.bdib(curve_name, event_type='TRADE', interval=60, start_datetime=start_date, end_datetime=end_date)
+    df1 = df.copy()
+    df['diff'] = df1['high'] - df1['low']
+    columns = ['time', 'high', 'low', 'diff']
+    df = df[columns]
+
+    # Load and preprocess past event data
+    data = pd.read_csv('half_year_data.csv')
+    data = data.rename(columns={'Date Time': 'time', 'Country Code': 'c', 'Event': 'event', 'Period': 'period', 'Ticker': 'ticker', 'S': 's'})
+    columns = ['time', 'c', 'event', 'ticker']
+    data['time'] = pd.to_datetime(data['time'], errors='coerce')
+    data['time'] = data['time'].fillna(pd.to_datetime(data['time'].dropna().dt.strftime('%m/%d/%Y 00:00')))
+    data = data[columns]
+    data = data.dropna(subset=['time'])
+    data = data[data['c'] == country_code]
+
+    # Expand the time window to include the following 5 hours after the event
+    data_expanded = pd.concat([data.assign(time=data['time'] + pd.Timedelta(hours=i)) for i in range(6)], ignore_index=True)
+
+    # Merge dataframes to get the price differences
+    merged_df = pd.merge(data_expanded, df, on=['time'], how='inner')
+
+    # Calculate event volatility
+    event_volatility = merged_df.groupby('event').agg(
+        highest_high=pd.NamedAgg(column='high', aggfunc='max'),
+        lowest_low=pd.NamedAgg(column='low', aggfunc='min')
+    ).reset_index()
+
+    event_volatility['volatility'] = event_volatility['highest_high'] - event_volatility['lowest_low']
+
+    # Sort events by volatility
+    event_analysis = event_volatility.sort_values(by='volatility', ascending=False)
+
+    # Determine the top 20% major events
+    threshold = event_analysis['volatility'].quantile(0.8)
+    major_events = event_analysis[event_analysis['volatility'] >= threshold]
+
+    # Extract past high volatility event names and tickers
+    high_vol_events = major_events['event'].unique()
+    high_vol_tickers = data[data['event'].isin(high_vol_events)]['ticker'].unique()
+
+    # Load future event data
+    future_data = pd.read_csv(future_data_filename)
+    future_data = future_data.rename(columns={'Date Time': 'time', 'Country Code': 'c', 'Event': 'event', 'Period': 'period', 'Ticker': 'ticker', 'S': 's'})
+    future_data['time'] = pd.to_datetime(future_data['time'], errors='coerce')
+    future_data = future_data.dropna(subset=['time'])
+    future_data = future_data[future_data['c'] == country_code]
+
+    # Filter future high volatility events
+    future_high_vol_events = future_data[
+        future_data['event'].isin(high_vol_events) | future_data['ticker'].isin(high_vol_tickers)
+    ]
+
+    # Print and save future high volatility events
+    print(f"Future High Volatility Events for {curve_name}:")
+    print(future_high_vol_events)
+    future_high_vol_events.to_csv(output_filename)
+
+# Example usage
+filter_future_high_volatility_events(
+    country_code='US',
+    curve_name='USOSFR10 BGN Curncy',
+    start_date='2024-09-26',
+    end_date='2025-04-11',
+    output_filename='future_US_major_event.csv',
+    future_data_filename='bloomberg_economic_calendar.csv'
+)
